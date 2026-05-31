@@ -2,42 +2,25 @@ import torch
 import pandas as pd
 import numpy as np
 import random
+import joblib # <-- NUEVO: Para cargar el escalador matemático
 from vae_model import VariationalAutoencoder
-from preprocessor import load_and_sample, preprocess_for_vae
 
-def generate_synthetic_transactions(uploaded_file, num_samples=5000, output_file="synthetic_data.csv"):
-    print("=== Phase 1: Reconstructing the Environment ===")
+def generate_synthetic_transactions(uploaded_file, num_samples=5000, output_file="synthetic_data_example.csv"):
+    print("=== Phase 1: Loading Original Structure & Scaler ===")
     
+    # Solo leemos 5 líneas del archivo para saber cómo ordenarle las columnas al usuario final
     uploaded_file.seek(0)
     df_real_preview = pd.read_csv(uploaded_file, nrows=5)
     original_columns = df_real_preview.columns
     
-    # Usamos un chunk grande directo para asegurar mejor cobertura
-    uploaded_file.seek(0) 
-    df_dummy = pd.read_csv(uploaded_file, nrows=50000) 
-    uploaded_file.seek(0) 
-    
-    # ---------------------------------------------------------
-    # FIX 1: ALINEACIÓN FORZADA DE FEATURES 
-    # Aseguramos que get_dummies genere las 5 columnas siempre, 
-    # incluso si la rara categoría 'DEBIT' no está en la muestra.
-    # ---------------------------------------------------------
-    if 'type' in df_dummy.columns:
-        df_dummy['type'] = pd.Categorical(
-            df_dummy['type'], 
-            categories=['PAYMENT', 'TRANSFER', 'CASH_OUT', 'DEBIT', 'CASH_IN']
-        )
-        
-    _, scaler = preprocess_for_vae(df_dummy)
-    input_dimension_scaler = len(scaler.feature_names_in_)
+    # --- EL CAMBIO CRÍTICO ---
+    # Cargamos la misma regla de medición exacta que usamos en el entrenamiento
+    scaler = joblib.load('vae_scaler.pkl')
     
     print("\n=== Phase 2: Loading the AI Model ===")
-    # ---------------------------------------------------------
-    # FIX 2: CARGA ESTRICTA DE PESOS
-    # Forzamos input_dim=11 porque el checkpoint .pth exige exactamente esa dimensión.
-    # ---------------------------------------------------------
+    # Nuestro input_dim ahora está garantizado en 11 gracias a las categorías fijas
     model = VariationalAutoencoder(input_dim=11, hidden_dim=32, latent_dim=4)
-    model.load_state_dict(torch.load('vae_weights.pth', map_location=torch.device('cpu')))
+    model.load_state_dict(torch.load('vae_weights (2).pth', map_location=torch.device('cpu')))
     model.eval() 
     
     print(f"\n=== Phase 3: Generating {num_samples} Synthetic Records ===")
@@ -48,14 +31,7 @@ def generate_synthetic_transactions(uploaded_file, num_samples=5000, output_file
     print("=== Phase 4: Formatting and Exporting ===")
     scaled_synthetic_data = scaled_synthetic_tensors.numpy()
     
-    # ---------------------------------------------------------
-    # FIX 3: RECORTADOR DE SEGURIDAD (Padding dinámico)
-    # Si el VAE generó 11 datos por fila pero el Scaler solo espera 10,
-    # descartamos la columna huérfana para evitar que inverse_transform crashee.
-    # ---------------------------------------------------------
-    if input_dimension_scaler == 10 and scaled_synthetic_data.shape[1] == 11:
-        scaled_synthetic_data = scaled_synthetic_data[:, :10]
-        
+    # El scaler devuelve los datos a su estado ANTES de escalar
     real_values_data = scaler.inverse_transform(scaled_synthetic_data)
     
     feature_names = scaler.feature_names_in_
@@ -69,11 +45,15 @@ def generate_synthetic_transactions(uploaded_file, num_samples=5000, output_file
         df_synthetic['type'] = df_synthetic[type_columns].idxmax(axis=1).str.replace('type_', '')
         df_synthetic = df_synthetic.drop(columns=type_columns)
         
-    # B. Limpiar Numéricos (Nada de dinero negativo)
+    # B. REVERTIR LOGARITMO Y LIMPIAR NUMÉRICOS
     numeric_cols = ['amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest']
     valid_numeric_cols = [c for c in numeric_cols if c in df_synthetic.columns]
+    
     for col in valid_numeric_cols:
-        df_synthetic[col] = df_synthetic[col].abs().round(2)
+        # 1. Función exponencial inversa
+        df_synthetic[col] = np.expm1(df_synthetic[col])
+        # 2. Forzar piso en cero (clip) para evitar saldos negativos por ruido estadístico
+        df_synthetic[col] = df_synthetic[col].clip(lower=0).round(2)
 
     # C. Metadatos y Variables de Alta Cardinalidad
     def generate_fake_account(prefix='C'):

@@ -6,3 +6,5 @@ vae_weights.pth
 .venv/
 synthetic_data.csv
 validation.csv
+vae_scaler.pkl
+vae_weights (2).pth
